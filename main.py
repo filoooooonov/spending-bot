@@ -1,10 +1,15 @@
 from typing import Final
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
+BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 
 
-TOKEN: Final = '8365713609:AAG1IuyqVX71GMbRH1N9d4c8M_8w3loi32k'
-BOT_USERNAME: Final = '@AlekseiFilonovSpendingBot'
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Hello! Thank you for using the spending bot. How can I help you today?')
