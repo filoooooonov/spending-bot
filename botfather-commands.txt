@@ -1,0 +1,6 @@
+start - Start the bot and see welcome message
+help - Show how to use the bot
+history - View your recent expenses
+total - See your total spending
+clear - Delete all your spending data
+
