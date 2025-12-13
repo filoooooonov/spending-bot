@@ -12,7 +12,8 @@ load_dotenv()
 TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
 BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 ALLOWED_USER_ID: Final = os.environ.get('ALLOWED_USER_ID')
-DATA_FILE: Final = 'spending_data.json'
+SPENDING_DATA_FILE: Final = 'spending_data.json'
+INCOME_DATA_FILE: Final = 'income_data.json'
 
 
 def is_authorized(user_id: int) -> bool:
@@ -24,16 +25,32 @@ def is_authorized(user_id: int) -> bool:
 
 def load_spending_data() -> dict:
     """Load spending data from JSON file."""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+    if os.path.exists(SPENDING_DATA_FILE):
+        with open(SPENDING_DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
 
 
 def save_spending_data(data: dict) -> None:
     """Save spending data to JSON file."""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+    with open(SPENDING_DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_income_data() -> dict:
+    """Load income data from JSON file."""
+    if os.path.exists(INCOME_DATA_FILE):
+        with open(INCOME_DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_income_data(data: dict) -> None:
+    """Save income data to JSON file."""
+    with open(INCOME_DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# -------------------
 
 
 def add_expense(user_id: str, amount: float, description: str) -> dict:
@@ -63,6 +80,36 @@ def parse_expense(text: str) -> tuple[float, str] | None:
         return (amount, description)
     return None
 
+def add_income(user_id: str, amount: float, description: str) -> dict:
+    """Add an income for a user."""
+    data = load_income_data()
+    
+    if user_id not in data:
+        data[user_id] = []
+
+    income = {
+        'amount': amount,
+        'description': description,
+        'date': datetime.now().isoformat()
+    }
+    
+    data[user_id].append(income)
+    save_income_data(data)
+    return income
+
+
+def parse_income(text: str) -> tuple[float, str] | None:
+    """Parse income from text like '+500 aalto' or '+15.50 salary'."""
+    match = re.match(r'^\+(\d+(?:[.,]\d+)?)\s+(.+)$', text.strip())
+    if match:
+        amount = float(match.group(1).replace(',', '.'))
+        description = match.group(2).strip()
+        return (amount, description)
+    return None
+
+
+# -------------------
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
@@ -71,6 +118,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '👋 Hello! I\'m your spending tracker bot.\n\n'
         '💰 To log an expense, send: <amount> <description>\n'
         'Example: 15 alepa\n\n'
+        '💵 To log income, send: +<amount> <description>\n'
+        'Example: +500 aalto\n\n'
         '📊 Commands:\n'
         '/history - View your spending history\n'
         '/total - See your total spending\n'
@@ -88,6 +137,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '  • 15 alepa\n'
         '  • 25.50 lunch\n'
         '  • 100 groceries\n\n'
+        '💵 Log income: Send + followed by amount and description\n'
+        'Examples:\n'
+        '  • +500 aalto\n'
+        '  • +1000 salary\n\n'
         '📊 Commands:\n'
         '/history - View recent expenses\n'
         '/total - See total spending\n'
@@ -156,20 +209,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f'User ({user_id}): "{text}"')
     
-    # Try to parse as expense
-    expense = parse_expense(text)
-    
-    if expense:
-        amount, description = expense
-        add_expense(user_id, amount, description)
-        response = f'✅ Saved: €{amount:.2f} - {description}'
+    # Try to parse as income first (starts with +)
+    income = parse_income(text)
+    if income:
+        amount, description = income
+        add_income(user_id, amount, description)
+        response = f'💵 Income saved: €{amount:.2f} - {description}'
     else:
-        response = (
-            '❓ I didn\'t understand that.\n\n'
-            'To log an expense, send: <amount> <description>\n'
-            'Example: 15 alepa\n\n'
-            'Type /help for more info.'
-        )
+        # Try to parse as expense
+        expense = parse_expense(text)
+        if expense:
+            amount, description = expense
+            add_expense(user_id, amount, description)
+            response = f'✅ Saved: €{amount:.2f} - {description}'
+        else:
+            response = (
+                '❓ I didn\'t understand that.\n\n'
+                'To log an expense, send: <amount> <description>\n'
+                'Example: 15 alepa\n\n'
+                'To log income, send: +<amount> <description>\n'
+                'Example: +500 aalto\n\n'
+                'Type /help for more info.'
+            )
     
     print(f'Bot: {response}')
     await update.message.reply_text(response)
