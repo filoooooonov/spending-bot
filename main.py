@@ -16,7 +16,16 @@ scopes = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+# Load credentials from environment variable (Railway) or file (local)
+google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+if google_credentials_json:
+    # Parse JSON string from environment variable
+    creds_info = json.loads(google_credentials_json)
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+else:
+    # Fall back to file for local development
+    creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+
 client = gspread.authorize(creds)
 sheet_id = "14LYEWi4vJi261oTxE1HH4TxluTYcVg4zWDok8IwbJc4"
 workbook = client.open_by_key(sheet_id)
