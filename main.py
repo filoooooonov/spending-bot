@@ -2,18 +2,64 @@ from typing import Final
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
-from datetime import datetime
 import os
 import json
 import re
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+
 
 load_dotenv()
+
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+client = gspread.authorize(creds)
+sheet_id = "14LYEWi4vJi261oTxE1HH4TxluTYcVg4zWDok8IwbJc4"
+workbook = client.open_by_key(sheet_id)
+
 
 TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
 BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 ALLOWED_USER_ID: Final = os.environ.get('ALLOWED_USER_ID')
 SPENDING_DATA_FILE: Final = 'spending_data.json'
 INCOME_DATA_FILE: Final = 'income_data.json'
+
+
+def get_current_sheet() -> gspread.Worksheet:
+    """Get the current sheet for the current month."""
+    # TODO: uncomment this for deployment
+    # current_month = datetime.now().strftime("%B")
+    current_month = "January"
+    return workbook.worksheet(current_month)
+
+
+def load_spending_data() -> dict:
+    """Read values from columns M and N starting at row 5, return dict mapping M5: N5."""
+    sheet = get_current_sheet()
+    
+    # Get all values from columns M and N
+    col_spending_labels = sheet.col_values(13)  # Column M
+    col_spending_amounts = sheet.col_values(14)  # Column N
+    
+    # Slice to get values from row 5 onwards
+    spending_labels = col_spending_labels[4:] if len(col_spending_labels) > 4 else []
+    spending_amounts = col_spending_amounts[4:] if len(col_spending_amounts) > 4 else []
+    
+    # Create dictionary, filtering out empty M values
+    spending_values = {}
+    for i in range(max(len(spending_labels), len(spending_amounts))):
+        label = spending_labels[i] if i < len(spending_labels) else ""
+        amount = spending_amounts[i] if i < len(spending_amounts) else ""
+        
+        # Only add to dict if label is not empty
+        if label.strip():
+            spending_values[label] = amount
+    
+    return spending_values
 
 
 def is_authorized(user_id: int) -> bool:
@@ -23,52 +69,33 @@ def is_authorized(user_id: int) -> bool:
     return str(user_id) == ALLOWED_USER_ID
 
 
-def load_spending_data() -> dict:
-    """Load spending data from JSON file."""
-    if os.path.exists(SPENDING_DATA_FILE):
-        with open(SPENDING_DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def save_spending_data(data: dict) -> None:
-    """Save spending data to JSON file."""
-    with open(SPENDING_DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def load_income_data() -> dict:
-    """Load income data from JSON file."""
-    if os.path.exists(INCOME_DATA_FILE):
-        with open(INCOME_DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def save_income_data(data: dict) -> None:
-    """Save income data to JSON file."""
-    with open(INCOME_DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-# -------------------
-
-
-def add_expense(user_id: str, amount: float, description: str) -> dict:
-    """Add an expense for a user."""
-    data = load_spending_data()
-    
-    if user_id not in data:
-        data[user_id] = []
-    
-    expense = {
-        'amount': amount,
-        'description': description,
-        'date': datetime.now().isoformat()
-    }
-    
-    data[user_id].append(expense)
-    save_spending_data(data)
-    return expense
+def add_expense(user_id: str, amount: float, label: str) -> bool:
+    """Add an expense to the first empty cell starting from row 5 in columns M and N."""
+    try:
+        sheet = get_current_sheet()
+        col_m = sheet.col_values(13)
+        
+        # Find first empty cell from row 5 onwards
+        if len(col_m) < 5:
+            next_row = 5
+        else:
+            empty_index = next(
+                (i for i in range(4, len(col_m)) if not col_m[i].strip()),
+                len(col_m)
+            )
+            next_row = empty_index + 1
+        
+        # Write to both columns
+        sheet.update(range_name=f"M{next_row}:N{next_row}", values=[[label, amount]])
+        
+        # Verify write succeeded - just check that something was written to the cells
+        written_label = sheet.cell(next_row, 13).value
+        written_amount = sheet.cell(next_row, 14).value
+        
+        return (written_label is not None and str(written_label).strip() != "" and
+                written_amount is not None and str(written_amount).strip() != "")
+    except Exception:
+        return False
 
 
 def parse_expense(text: str) -> tuple[float, str] | None:
@@ -80,32 +107,6 @@ def parse_expense(text: str) -> tuple[float, str] | None:
         return (amount, description)
     return None
 
-def add_income(user_id: str, amount: float, description: str) -> dict:
-    """Add an income for a user."""
-    data = load_income_data()
-    
-    if user_id not in data:
-        data[user_id] = []
-
-    income = {
-        'amount': amount,
-        'description': description,
-        'date': datetime.now().isoformat()
-    }
-    
-    data[user_id].append(income)
-    save_income_data(data)
-    return income
-
-
-def parse_income(text: str) -> tuple[float, str] | None:
-    """Parse income from text like '+500 aalto' or '+15.50 salary'."""
-    match = re.match(r'^\+(\d+(?:[.,]\d+)?)\s+(.+)$', text.strip())
-    if match:
-        amount = float(match.group(1).replace(',', '.'))
-        description = match.group(2).strip()
-        return (amount, description)
-    return None
 
 
 # -------------------
@@ -118,13 +119,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '👋 Hello! I\'m your spending tracker bot.\n\n'
         '💰 To log an expense, send: <amount> <description>\n'
         'Example: 15 alepa\n\n'
-        '💵 To log income, send: +<amount> <description>\n'
-        'Example: +500 aalto\n\n'
         '📊 Commands:\n'
         '/history - View your spending history\n'
-        '/total - See your total spending\n'
+        '/month_total - See your total spending for the current month\n'
+        '/edit - Edit a previous spending entry\n'
         '/help - Show this help message'
     )
+    
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,71 +134,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '📖 How to use this bot:\n\n'
         '💰 Log expense: Send a number followed by description\n'
-        'Examples:\n'
-        '  • 15 alepa\n'
-        '  • 25.50 lunch\n'
-        '  • 100 groceries\n\n'
-        '💵 Log income: Send + followed by amount and description\n'
-        'Examples:\n'
-        '  • +500 aalto\n'
-        '  • +1000 salary\n\n'
+        'Example:\n'
+        '  • 15 alepa\n'    
         '📊 Commands:\n'
         '/history - View recent expenses\n'
-        '/total - See total spending\n'
-        '/clear - Clear all your data'
+        '/month_total - See total spending for the current month\n'
+        "/edit - Edit this month's expenses\n"
+        '/help - Show this help message'
     )
 
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show spending history for the user."""
+
+async def month_total_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show total spending for the current month."""
     if not is_authorized(update.effective_user.id):
         return
     user_id = str(update.message.chat.id)
     data = load_spending_data()
     
-    if user_id not in data or not data[user_id]:
-        await update.message.reply_text('📭 No spending history yet. Send an expense like "15 alepa" to start!')
+    if len(data) == 0:
+        await update.message.reply_text('📭 No spending history yet.')
         return
-    
-    expenses = data[user_id][-10:]  # Last 10 expenses
-    
-    message = '📜 Your recent expenses:\n\n'
-    for exp in reversed(expenses):
-        date = datetime.fromisoformat(exp['date']).strftime('%d/%m')
-        message += f"• €{exp['amount']:.2f} - {exp['description']} ({date})\n"
-    
+        
+    message = 'Your recent expenses:\n\n'
+    for label, amount_str in data.items():
+        message += f"• {amount_str} - {label}\n"
+        
     await update.message.reply_text(message)
 
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit this month's expenses."""
+    await update.message.reply_text('🔍 This feature is not available yet.')
+     
 
-async def total_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show total spending for the user."""
-    if not is_authorized(update.effective_user.id):
-        return
-    user_id = str(update.message.chat.id)
-    data = load_spending_data()
-    
-    if user_id not in data or not data[user_id]:
-        await update.message.reply_text('📭 No spending yet!')
-        return
-    
-    total = sum(exp['amount'] for exp in data[user_id])
-    count = len(data[user_id])
-    
-    await update.message.reply_text(f'💰 Total spending: €{total:.2f}\n📝 Total entries: {count}')
-
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear all spending data for the user."""
-    if not is_authorized(update.effective_user.id):
-        return
-    user_id = str(update.message.chat.id)
-    data = load_spending_data()
-    
-    if user_id in data:
-        del data[user_id]
-        save_spending_data(data)
-    
-    await update.message.reply_text('🗑️ All your spending data has been cleared.')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,28 +178,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f'User ({user_id}): "{text}"')
     
-    # Try to parse as income first (starts with +)
-    income = parse_income(text)
-    if income:
-        amount, description = income
-        add_income(user_id, amount, description)
-        response = f'💵 Income saved: €{amount:.2f} - {description}'
-    else:
-        # Try to parse as expense
-        expense = parse_expense(text)
-        if expense:
-            amount, description = expense
-            add_expense(user_id, amount, description)
-            response = f'✅ Saved: €{amount:.2f} - {description}'
+    # Try to parse as expense
+    expense = parse_expense(text)
+    if expense:
+        amount, label = expense
+        success = add_expense(user_id, amount, label)
+        if not success:
+            response = '❌ Failed to save expense. Please try again.'
         else:
-            response = (
-                '❓ I didn\'t understand that.\n\n'
-                'To log an expense, send: <amount> <description>\n'
-                'Example: 15 alepa\n\n'
-                'To log income, send: +<amount> <description>\n'
-                'Example: +500 aalto\n\n'
-                'Type /help for more info.'
-            )
+            response = f'✅ Saved: €{amount:.2f} - {label}'
+    else:
+        response = (
+            '❓ I didn\'t understand that.\n\n'
+            'To log an expense, send: <amount> <description>\n'
+            'Example: 15 alepa\n\n'
+            'Type /help for more info.'
+        )
     
     print(f'Bot: {response}')
     await update.message.reply_text(response)
@@ -245,9 +208,8 @@ if __name__ == '__main__':
     # Commands
     app.add_handler(CommandHandler('start', start_command))
     app.add_handler(CommandHandler('help', help_command))
-    app.add_handler(CommandHandler('history', history_command))
-    app.add_handler(CommandHandler('total', total_command))
-    app.add_handler(CommandHandler('clear', clear_command))
+    app.add_handler(CommandHandler('month_total', month_total_command))
+    app.add_handler(CommandHandler('edit', edit_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
