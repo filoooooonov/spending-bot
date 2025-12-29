@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import os
 import json
 import re
+import base64
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -19,12 +20,25 @@ scopes = [
 # Load credentials from environment variable (Railway) or file (local)
 google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 if google_credentials_json:
-    # Parse JSON string from environment variable
-    creds_info = json.loads(google_credentials_json)
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-else:
+    try:
+        # Try base64 decode first (for Railway to avoid build-time parsing issues)
+        try:
+            decoded = base64.b64decode(google_credentials_json).decode('utf-8')
+            creds_info = json.loads(decoded)
+        except Exception:
+            # If base64 decode fails, treat as plain JSON
+            creds_info = json.loads(google_credentials_json)
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+elif os.path.exists('credentials.json'):
     # Fall back to file for local development
     creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+else:
+    raise ValueError(
+        "Google credentials not found. "
+        "Set GOOGLE_CREDENTIALS_JSON environment variable (base64 encoded or JSON) or provide credentials.json file."
+    )
 
 client = gspread.authorize(creds)
 sheet_id = "14LYEWi4vJi261oTxE1HH4TxluTYcVg4zWDok8IwbJc4"
