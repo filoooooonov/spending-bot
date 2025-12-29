@@ -17,32 +17,47 @@ scopes = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-# Load credentials from environment variable (Railway) or file (local)
-google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-if google_credentials_json:
-    try:
-        # Try base64 decode first (for Railway to avoid build-time parsing issues)
-        try:
-            decoded = base64.b64decode(google_credentials_json).decode('utf-8')
-            creds_info = json.loads(decoded)
-        except Exception:
-            # If base64 decode fails, treat as plain JSON
-            creds_info = json.loads(google_credentials_json)
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
-elif os.path.exists('credentials.json'):
-    # Fall back to file for local development
-    creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-else:
-    raise ValueError(
-        "Google credentials not found. "
-        "Set GOOGLE_CREDENTIALS_JSON environment variable (base64 encoded or JSON) or provide credentials.json file."
-    )
-
-client = gspread.authorize(creds)
 sheet_id = "14LYEWi4vJi261oTxE1HH4TxluTYcVg4zWDok8IwbJc4"
-workbook = client.open_by_key(sheet_id)
+
+# Lazy initialization to avoid Railway accessing env vars during build
+_client = None
+_workbook = None
+
+def get_client():
+    """Get or create the gspread client (lazy initialization)."""
+    global _client
+    if _client is None:
+        # Load credentials from environment variable (Railway) or file (local)
+        google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+        if google_credentials_json:
+            try:
+                # Try base64 decode first (for Railway to avoid build-time parsing issues)
+                try:
+                    decoded = base64.b64decode(google_credentials_json).decode('utf-8')
+                    creds_info = json.loads(decoded)
+                except Exception:
+                    # If base64 decode fails, treat as plain JSON
+                    creds_info = json.loads(google_credentials_json)
+                creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+        elif os.path.exists('credentials.json'):
+            # Fall back to file for local development
+            creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+        else:
+            raise ValueError(
+                "Google credentials not found. "
+                "Set GOOGLE_CREDENTIALS_JSON environment variable (base64 encoded or JSON) or provide credentials.json file."
+            )
+        _client = gspread.authorize(creds)
+    return _client
+
+def get_workbook():
+    """Get or create the workbook (lazy initialization)."""
+    global _workbook
+    if _workbook is None:
+        _workbook = get_client().open_by_key(sheet_id)
+    return _workbook
 
 
 TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -57,7 +72,7 @@ def get_current_sheet() -> gspread.Worksheet:
     # TODO: uncomment this for deployment
     # current_month = datetime.now().strftime("%B")
     current_month = "January"
-    return workbook.worksheet(current_month)
+    return get_workbook().worksheet(current_month)
 
 
 def load_spending_data() -> dict:
