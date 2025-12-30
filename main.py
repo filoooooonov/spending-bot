@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import os
 import json
 import re
-import base64
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -17,54 +16,33 @@ scopes = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
+# Load credentials from environment variable (Railway) or file (local)
+# According to Railway docs: JSON should be minified (single line) with no external quotes
+google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+if google_credentials_json:
+    try:
+        creds_info = json.loads(google_credentials_json)
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+elif os.path.exists('credentials.json'):
+    # Fall back to file for local development
+    creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+else:
+    raise ValueError(
+        "Google credentials not found. "
+        "Set GOOGLE_CREDENTIALS_JSON environment variable (minified JSON, single line) or provide credentials.json file."
+    )
+
+client = gspread.authorize(creds)
 sheet_id = "14LYEWi4vJi261oTxE1HH4TxluTYcVg4zWDok8IwbJc4"
-
-# Lazy initialization to avoid Railway accessing env vars during build
-_client = None
-_workbook = None
-
-def get_client():
-    """Get or create the gspread client (lazy initialization)."""
-    global _client
-    if _client is None:
-        # Load credentials from environment variable (Railway) or file (local)
-        google_credentials_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-        if google_credentials_json:
-            try:
-                # Try base64 decode first (for Railway to avoid build-time parsing issues)
-                try:
-                    decoded = base64.b64decode(google_credentials_json).decode('utf-8')
-                    creds_info = json.loads(decoded)
-                except Exception:
-                    # If base64 decode fails, treat as plain JSON
-                    creds_info = json.loads(google_credentials_json)
-                creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
-        elif os.path.exists('credentials.json'):
-            # Fall back to file for local development
-            creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-        else:
-            raise ValueError(
-                "Google credentials not found. "
-                "Set GOOGLE_CREDENTIALS_JSON environment variable (base64 encoded or JSON) or provide credentials.json file."
-            )
-        _client = gspread.authorize(creds)
-    return _client
-
-def get_workbook():
-    """Get or create the workbook (lazy initialization)."""
-    global _workbook
-    if _workbook is None:
-        _workbook = get_client().open_by_key(sheet_id)
-    return _workbook
+workbook = client.open_by_key(sheet_id)
 
 
 TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
 BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 ALLOWED_USER_ID: Final = os.environ.get('ALLOWED_USER_ID')
 SPENDING_DATA_FILE: Final = 'spending_data.json'
-INCOME_DATA_FILE: Final = 'income_data.json'
 
 
 def get_current_sheet() -> gspread.Worksheet:
@@ -72,7 +50,7 @@ def get_current_sheet() -> gspread.Worksheet:
     # TODO: uncomment this for deployment
     # current_month = datetime.now().strftime("%B")
     current_month = "January"
-    return get_workbook().worksheet(current_month)
+    return workbook.worksheet(current_month)
 
 
 def load_spending_data() -> dict:
@@ -82,20 +60,22 @@ def load_spending_data() -> dict:
     # Get all values from columns M and N
     col_spending_labels = sheet.col_values(13)  # Column M
     col_spending_amounts = sheet.col_values(14)  # Column N
+
+    
     
     # Slice to get values from row 5 onwards
     spending_labels = col_spending_labels[4:] if len(col_spending_labels) > 4 else []
     spending_amounts = col_spending_amounts[4:] if len(col_spending_amounts) > 4 else []
     
     # Create dictionary, filtering out empty M values
-    spending_values = {}
+    spending_values: list[dict] = []
     for i in range(max(len(spending_labels), len(spending_amounts))):
         label = spending_labels[i] if i < len(spending_labels) else ""
         amount = spending_amounts[i] if i < len(spending_amounts) else ""
-        
+      
         # Only add to dict if label is not empty
         if label.strip():
-            spending_values[label] = amount
+            spending_values.append({"amount": amount, "label": label})
     
     return spending_values
 
@@ -123,8 +103,8 @@ def add_expense(user_id: str, amount: float, label: str) -> bool:
             )
             next_row = empty_index + 1
         
-        # Write to both columns
-        sheet.update(range_name=f"M{next_row}:N{next_row}", values=[[label, amount]])
+        # Write to columns M, N, and O
+        sheet.update(range_name=f"M{next_row}:O{next_row}", values=[[label, amount, datetime.now().strftime("%Y-%m-%d")]])
         
         # Verify write succeeded - just check that something was written to the cells
         written_label = sheet.cell(next_row, 13).value
@@ -145,6 +125,16 @@ def parse_expense(text: str) -> tuple[float, str] | None:
         return (amount, description)
     return None
 
+
+def parse_amount(amount_str: str) -> float:
+    """Convert strings like '€3.00' or '3,50' to float."""
+    if amount_str is None:
+        return 0.0
+    cleaned = str(amount_str).strip()
+    cleaned = cleaned.replace('€', '').replace(',', '.').strip()
+    if not cleaned:
+        return 0.0
+    return float(cleaned)
 
 
 # -------------------
@@ -193,18 +183,24 @@ async def month_total_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if len(data) == 0:
         await update.message.reply_text('📭 No spending history yet.')
         return
-        
+
     message = 'Your recent expenses:\n\n'
-    for label, amount_str in data.items():
-        message += f"• {amount_str} - {label}\n"
-        
+    for item in data:
+        label = item["label"]
+        amount = item["amount"]
+        message += f"• {amount} - {label}\n"
+
+    total_spending = sum(parse_amount(item["amount"]) for item in data)
+    message += f"\nTotal spending this month: €{total_spending:.2f}\n"
+
     await update.message.reply_text(message)
+
+
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Edit this month's expenses."""
     await update.message.reply_text('🔍 This feature is not available yet.')
      
-
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,6 +231,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f'Bot: {response}')
     await update.message.reply_text(response)
+
+
 
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
