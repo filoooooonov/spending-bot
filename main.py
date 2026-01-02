@@ -47,9 +47,7 @@ SPENDING_DATA_FILE: Final = 'spending_data.json'
 
 def get_current_sheet() -> gspread.Worksheet:
     """Get the current sheet for the current month."""
-    # TODO: uncomment this for deployment
-    # current_month = datetime.now().strftime("%B")
-    current_month = "January"
+    current_month = datetime.now().strftime("%B")
     return workbook.worksheet(current_month)
 
 
