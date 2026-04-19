@@ -1,7 +1,5 @@
 from typing import Final
-import asyncio
 from telegram import Update
-from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 import os
@@ -45,7 +43,6 @@ TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
 BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 ALLOWED_USER_ID: Final = os.environ.get('ALLOWED_USER_ID')
 SPENDING_DATA_FILE: Final = 'spending_data.json'
-TELEGRAM_CURSOR_FILE: Final = os.environ.get("TELEGRAM_CURSOR_FILE", "telegram_cursor.json")
 
 
 def get_current_sheet() -> gspread.Worksheet:
@@ -238,131 +235,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
-def get_start_text() -> str:
-    return (
-        'Hello! I\'m your spending tracker bot.\n\n'
-        'To log an expense, send: <amount> <description>\n'
-        'Example: 15 alepa\n\n'
-        'Commands:\n'
-        '/history - View your spending history\n'
-        '/month_total - See your total spending for the current month\n'
-        '/edit - Edit a previous spending entry\n'
-        '/help - Show this help message'
-    )
-
-
-def get_help_text() -> str:
-    return (
-        '📖 How to use this bot:\n\n'
-        '💰 Log expense: Send a number followed by description\n'
-        'Example:\n'
-        '  • 15 alepa\n'
-        '📊 Commands:\n'
-        '/history - View recent expenses\n'
-        '/month_total - See total spending for the current month\n'
-        "/edit - Edit this month's expenses\n"
-        '/help - Show this help message'
-    )
-
-
-def build_month_total_text() -> str:
-    data = load_spending_data()
-    if len(data) == 0:
-        return '📭 No spending history yet.'
-
-    message = 'Your recent expenses:\n\n'
-    for item in data:
-        message += f"• {item['amount']} - {item['label']}\n"
-
-    total_spending = sum(parse_amount(item["amount"]) for item in data)
-    message += f"\nTotal spending this month: €{total_spending:.2f}\n"
-    return message
-
-
-def load_last_update_id() -> int:
-    try:
-        if not os.path.exists(TELEGRAM_CURSOR_FILE):
-            return 0
-        with open(TELEGRAM_CURSOR_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        last_update_id = int(data.get("last_update_id", 0))
-        return max(0, last_update_id)
-    except Exception:
-        return 0
-
-
-def save_last_update_id(last_update_id: int) -> None:
-    tmp_path = f"{TELEGRAM_CURSOR_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump({"last_update_id": int(last_update_id)}, f)
-    os.replace(tmp_path, TELEGRAM_CURSOR_FILE)
-
-
-async def process_update(bot: Bot, update: Update) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    if update.effective_user and not is_authorized(update.effective_user.id):
-        return
-
-    text = update.message.text
-    chat_id = update.message.chat_id
-
-    print(f'User ({chat_id}): "{text}"')
-
-    command = text.strip().split()[0] if text.strip().startswith("/") else ""
-    if command in {"/start", "/help", "/month_total", "/edit"}:
-        if command == "/start":
-            response = get_start_text()
-        elif command == "/help":
-            response = get_help_text()
-        elif command == "/month_total":
-            response = build_month_total_text()
-        else:
-            response = "🔍 This feature is not available yet."
-
-        print(f"Bot: {response}")
-        await bot.send_message(chat_id=chat_id, text=response)
-        return
-
-    expense = parse_expense(text)
-    if expense:
-        amount, label = expense
-        success = add_expense(str(chat_id), amount, label)
-        if not success:
-            print("Failed to save expense.")
-    else:
-        print("Unrecognized message format.")
-
-
-async def run_cron_drain() -> None:
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
-
-    bot = Bot(token=TOKEN)
-    last_update_id = load_last_update_id()
-    last_chat_id: int | None = None
-    processed_any = False
-
-    while True:
-        updates = await bot.get_updates(offset=last_update_id + 1, timeout=0)
-        if not updates:
-            break
-
-        for upd in updates:
-            last_update_id = max(last_update_id, int(upd.update_id))
-            if upd.message:
-                last_chat_id = upd.message.chat_id
-            try:
-                await process_update(bot, upd)
-                processed_any = True
-            finally:
-                save_last_update_id(last_update_id)
-
-    if processed_any and last_chat_id is not None:
-        await bot.send_message(chat_id=last_chat_id, text="All spendings are saved!")
-
-
 if __name__ == '__main__':
-    print("Running cron drain...")
-    asyncio.run(run_cron_drain())
+    print('Starting bot...')
+    app = Application.builder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler('start', start_command))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_handler(CommandHandler('month_total', month_total_command))
+    app.add_handler(CommandHandler('edit', edit_command))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT, handle_message))
+
+    # Errors
+    app.add_error_handler(error)
+
+    # Polls the bot
+    print('Polling...')
+    app.run_polling(poll_interval=3)    
