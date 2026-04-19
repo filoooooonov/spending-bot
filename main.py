@@ -1,5 +1,7 @@
 from typing import Final
 import asyncio
+import csv
+import io
 from telegram import Update
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -106,6 +108,36 @@ def add_expense(user_id: str, amount: float, label: str) -> bool:
         
         # Write to columns M, N, and O
         sheet.update(range_name=f"M{next_row}:O{next_row}", values=[[label, amount, datetime.now().strftime("%Y-%m-%d")]])
+
+        # Color the written range (M:O) light green.
+        sheet_id = sheet.id
+        start_row_index = next_row - 1  # 0-based, inclusive
+        end_row_index = next_row  # 0-based, exclusive
+        start_col_index = 12  # M
+        end_col_index = 15  # O (exclusive)
+        sheet.spreadsheet.batch_update(
+            {
+                "requests": [
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": start_row_index,
+                                "endRowIndex": end_row_index,
+                                "startColumnIndex": start_col_index,
+                                "endColumnIndex": end_col_index,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}
+                                }
+                            },
+                            "fields": "userEnteredFormat.backgroundColor",
+                        }
+                    }
+                ]
+            }
+        )
         
         # Verify write succeeded - just check that something was written to the cells
         written_label = sheet.cell(next_row, 13).value
@@ -279,6 +311,280 @@ def build_month_total_text() -> str:
     return message
 
 
+def decode_csv_bytes(csv_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return csv_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return csv_bytes.decode("utf-8", errors="replace")
+
+
+def list_spendings_from_csv(csv_text: str) -> list[str]:
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+    spendings: list[str] = []
+
+    for row in reader:
+        amount_raw = (row.get("Summa") or "").strip()
+        if not amount_raw.startswith("-"):
+            continue
+
+        booking_date = (row.get("Kirjauspäivä") or "").strip()
+        recipient = (row.get("Saajan nimi") or "").strip()
+        message = (row.get("Viesti") or "").strip()
+
+        details = recipient or message or "Unknown"
+        spendings.append(f"{booking_date} {amount_raw} {details}".strip())
+
+    return spendings
+
+
+def parse_csv_spendings(csv_text: str) -> list[dict[str, str]]:
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+    spendings: list[dict[str, str]] = []
+
+    for row in reader:
+        amount_raw = (row.get("Summa") or "").strip()
+        if not amount_raw:
+            continue
+
+        is_income = amount_raw.startswith("+")
+        amount_value = abs(parse_amount(amount_raw))
+        amount_formatted = f"+{amount_value:.2f}" if is_income else f"{amount_value:.2f}"
+
+        spendings.append(
+            {
+                "date": (row.get("Kirjauspäivä") or "").strip(),
+                "amount": amount_formatted,
+                "type": (row.get("Tapahtumalaji") or "").strip(),
+                "receiver": (row.get("Saajan nimi") or "").strip(),
+            }
+        )
+
+    return spendings
+
+
+def parse_sheet_date(date_str: str) -> datetime:
+    cleaned = (date_str or "").strip()
+    if not cleaned:
+        return datetime.min
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    return datetime.min
+
+
+def load_existing_csv_rows(sheet: gspread.Worksheet) -> list[dict[str, str]]:
+    rows = sheet.get(range_name="R5:V")
+    existing: list[dict[str, str]] = []
+
+    for row in rows:
+        padded = (row + ["", "", "", "", ""])[:5]
+        item, receiver, amount, date, type_ = (cell.strip() for cell in padded)
+
+        if not any([item, receiver, amount, date, type_]):
+            continue
+
+        existing.append(
+            {"item": item, "receiver": receiver, "amount": amount, "date": date, "type": type_}
+        )
+
+    return existing
+
+
+def write_csv_rows_sorted(sheet: gspread.Worksheet, rows: list[dict[str, str]]) -> None:
+    values: list[list[object]] = []
+    for r in rows:
+        values.append([r.get("item", ""), r.get("receiver", ""), r.get("amount", ""), r.get("date", ""), r.get("type", "")])
+
+    if len(values) == 0:
+        return
+
+    start_row = 5
+    end_row = start_row + len(values) - 1
+    sheet.update(range_name=f"R{start_row}:V{end_row}", values=values)
+
+    # Clear any leftover old rows below, so deleted rows don't linger.
+    col_s = sheet.col_values(19)  # S (Receiver)
+    previous_last_row = max(4, len(col_s))
+    if previous_last_row > end_row:
+        sheet.update(
+            range_name=f"R{end_row + 1}:V{previous_last_row}",
+            values=[["", "", "", "", ""] for _ in range(previous_last_row - end_row)],
+        )
+
+    # Color the written range (R:V) light blue.
+    light_blue = {"red": 0.8, "green": 0.9, "blue": 1.0}
+    sheet_id = sheet.id
+    sheet.spreadsheet.batch_update(
+        {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": start_row - 1,  # 0-based
+                            "endRowIndex": end_row,
+                            "startColumnIndex": 17,  # R
+                            "endColumnIndex": 22,  # V (exclusive)
+                        },
+                        "cell": {"userEnteredFormat": {"backgroundColor": light_blue}},
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                }
+            ]
+        }
+    )
+
+
+def add_and_sort_csv_spendings_to_sheet(new_spendings: list[dict[str, str]]) -> int:
+    sheet = get_current_sheet()
+    existing = load_existing_csv_rows(sheet)
+
+    incoming_rows: list[dict[str, str]] = []
+    for item in new_spendings:
+        incoming_rows.append(
+            {
+                "item": "",  # keep empty for manual input
+                "receiver": item["receiver"],
+                "amount": item["amount"],
+                "date": item["date"],
+                "type": item["type"],
+            }
+        )
+
+    merged = existing + incoming_rows
+    merged.sort(key=lambda r: parse_sheet_date(r.get("date", "")))
+
+    write_csv_rows_sorted(sheet, merged)
+    return len(incoming_rows)
+
+
+def ensure_sheet_headers() -> None:
+    sheet = get_current_sheet()
+    sheet_id = sheet.id
+
+    light_green = {"red": 0.85, "green": 0.95, "blue": 0.85}
+    light_blue = {"red": 0.8, "green": 0.9, "blue": 1.0}
+
+    sheet.spreadsheet.batch_update(
+        {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 3,  # row 4
+                            "endRowIndex": 4,
+                            "startColumnIndex": 12,  # M
+                            "endColumnIndex": 15,  # O (exclusive)
+                        },
+                        "cell": {"userEnteredFormat": {"backgroundColor": light_green}},
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                },
+                {
+                    "updateCells": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 3,  # row 4
+                            "endRowIndex": 4,
+                            "startColumnIndex": 12,  # M
+                            "endColumnIndex": 13,
+                        },
+                        "rows": [
+                            {
+                                "values": [
+                                    {
+                                        "userEnteredValue": {"stringValue": "Expenses in cash"},
+                                        "userEnteredFormat": {
+                                            "textFormat": {"bold": True},
+                                        },
+                                    }
+                                ]
+                            }
+                        ],
+                        "fields": "userEnteredValue,userEnteredFormat.textFormat.bold",
+                    }
+                },
+                {
+                    "updateCells": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 3,  # row 4
+                            "endRowIndex": 4,
+                            "startColumnIndex": 17,  # R
+                            "endColumnIndex": 22,  # V (exclusive)
+                        },
+                        "rows": [
+                            {
+                                "values": [
+                                    {
+                                        "userEnteredValue": {"stringValue": "Item"},
+                                        "userEnteredFormat": {
+                                            "backgroundColor": light_blue,
+                                            "textFormat": {"bold": True},
+                                        },
+                                    },
+                                    {
+                                        "userEnteredValue": {"stringValue": "Receiver"},
+                                        "userEnteredFormat": {
+                                            "backgroundColor": light_blue,
+                                            "textFormat": {"bold": True},
+                                        },
+                                    },
+                                    {
+                                        "userEnteredValue": {"stringValue": "Amount"},
+                                        "userEnteredFormat": {
+                                            "backgroundColor": light_blue,
+                                            "textFormat": {"bold": True},
+                                        },
+                                    },
+                                    {
+                                        "userEnteredValue": {"stringValue": "Date"},
+                                        "userEnteredFormat": {
+                                            "backgroundColor": light_blue,
+                                            "textFormat": {"bold": True},
+                                        },
+                                    },
+                                    {
+                                        "userEnteredValue": {"stringValue": "Type"},
+                                        "userEnteredFormat": {
+                                            "backgroundColor": light_blue,
+                                            "textFormat": {"bold": True},
+                                        },
+                                    },
+                                ]
+                            }
+                        ],
+                        "fields": "userEnteredValue,userEnteredFormat(backgroundColor,textFormat.bold)",
+                    }
+                },
+            ]
+        }
+    )
+
+
+def chunk_lines(lines: list[str], header: str, max_chars: int = 3500) -> list[str]:
+    # Telegram max is 4096; keep buffer for safety.
+    chunks: list[str] = []
+    current = header.strip() + "\n"
+
+    for line in lines:
+        next_piece = f"- {line}\n"
+        if len(current) + len(next_piece) > max_chars and current.strip():
+            chunks.append(current.strip())
+            current = header.strip() + "\n" + next_piece
+        else:
+            current += next_piece
+
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
 def load_last_update_id() -> int:
     try:
         if not os.path.exists(TELEGRAM_CURSOR_FILE):
@@ -298,15 +604,36 @@ def save_last_update_id(last_update_id: int) -> None:
     os.replace(tmp_path, TELEGRAM_CURSOR_FILE)
 
 
-async def process_update(bot: Bot, update: Update) -> None:
-    if not update.message or not update.message.text:
-        return
+async def process_update(bot: Bot, update: Update) -> bool:
+    if not update.message:
+        return False
 
     if update.effective_user and not is_authorized(update.effective_user.id):
-        return
+        return False
+
+    chat_id = update.message.chat_id
+
+    if update.message.document and update.message.document.file_name:
+        file_name = update.message.document.file_name.strip()
+        if file_name.lower().endswith(".csv"):
+            tg_file = await bot.get_file(update.message.document.file_id)
+            csv_bytes = await tg_file.download_as_bytearray()
+            csv_text = decode_csv_bytes(bytes(csv_bytes))
+            spendings = parse_csv_spendings(csv_text)
+            uploaded_count = add_and_sort_csv_spendings_to_sheet(spendings)
+            if uploaded_count == 0:
+                await bot.send_message(chat_id=chat_id, text="CSV received, but no spendings found.")
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Successfully uploaded the csv to Google Sheets. ({uploaded_count} rows)",
+                )
+            return False
+
+    if not update.message.text:
+        return False
 
     text = update.message.text
-    chat_id = update.message.chat_id
 
     print(f'User ({chat_id}): "{text}"')
 
@@ -323,7 +650,7 @@ async def process_update(bot: Bot, update: Update) -> None:
 
         print(f"Bot: {response}")
         await bot.send_message(chat_id=chat_id, text=response)
-        return
+        return False
 
     expense = parse_expense(text)
     if expense:
@@ -331,8 +658,11 @@ async def process_update(bot: Bot, update: Update) -> None:
         success = add_expense(str(chat_id), amount, label)
         if not success:
             print("Failed to save expense.")
+            return False
+        return True
     else:
         print("Unrecognized message format.")
+        return False
 
 
 async def run_cron_drain() -> None:
@@ -340,9 +670,10 @@ async def run_cron_drain() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
 
     bot = Bot(token=TOKEN)
+    ensure_sheet_headers()
     last_update_id = load_last_update_id()
-    last_chat_id: int | None = None
-    processed_any = False
+    last_spending_chat_id: int | None = None
+    saved_any_spending = False
 
     while True:
         updates = await bot.get_updates(offset=last_update_id + 1, timeout=0)
@@ -351,16 +682,16 @@ async def run_cron_drain() -> None:
 
         for upd in updates:
             last_update_id = max(last_update_id, int(upd.update_id))
-            if upd.message:
-                last_chat_id = upd.message.chat_id
             try:
-                await process_update(bot, upd)
-                processed_any = True
+                saved_spending = await process_update(bot, upd)
+                if saved_spending and upd.message:
+                    last_spending_chat_id = upd.message.chat_id
+                    saved_any_spending = True
             finally:
                 save_last_update_id(last_update_id)
 
-    if processed_any and last_chat_id is not None:
-        await bot.send_message(chat_id=last_chat_id, text="All spendings are saved!")
+    if saved_any_spending and last_spending_chat_id is not None:
+        await bot.send_message(chat_id=last_spending_chat_id, text="All spendings are saved!")
 
 
 if __name__ == '__main__':
