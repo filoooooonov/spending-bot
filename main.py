@@ -891,7 +891,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(f"✅ Saved: €{amount:.2f} - {label}")
 
 
-async def run_webhook_server() -> None:
+def run_webhook_server() -> None:
     """
     Recommended for Render: long-lived service + Telegram webhook delivery (no polling gaps).
 
@@ -926,15 +926,14 @@ async def run_webhook_server() -> None:
 
     app.add_error_handler(error)
 
-    await app.bot.set_webhook(url=f"{public_url}{webhook_path}")
-
-    await app.run_webhook(
+    # NOTE: python-telegram-bot's run_webhook manages the asyncio loop internally.
+    # Don't wrap this in asyncio.run() / don't await it.
+    app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=webhook_path.lstrip("/"),
         webhook_url=f"{public_url}{webhook_path}",
         drop_pending_updates=False,
-        close_loop=False,
     )
 
 
@@ -971,7 +970,7 @@ if __name__ == '__main__':
     run_mode = (os.environ.get("RUN_MODE") or "cron").strip().lower()
     if run_mode == "webhook":
         print("Running webhook server...")
-        asyncio.run(run_webhook_server())
+        run_webhook_server()
     else:
         print("Running cron drain...")
         asyncio.run(run_cron_drain())
