@@ -1,2 +1,6 @@
 .env
 credentials.json
+csvs
+__pycache__/
+*.pyc
+category_cache.json

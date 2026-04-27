@@ -12,6 +12,9 @@ import re
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from datetime import timezone
+
+from category_cache import load_category_cache, normalize_receiver, save_category_cache
 
 
 load_dotenv()
@@ -50,10 +53,83 @@ SPENDING_DATA_FILE: Final = 'spending_data.json'
 TELEGRAM_CURSOR_FILE: Final = os.environ.get("TELEGRAM_CURSOR_FILE", "telegram_cursor.json")
 
 
+def normalize_month_name(month: str) -> str:
+    """Normalize user input to an English month name (e.g. '3' -> 'March', 'sep' -> 'September')."""
+    cleaned = (month or "").strip()
+    if not cleaned:
+        raise ValueError("Month is required")
+
+    lower = cleaned.lower()
+
+    month_by_number: dict[str, str] = {
+        "1": "January",
+        "01": "January",
+        "2": "February",
+        "02": "February",
+        "3": "March",
+        "03": "March",
+        "4": "April",
+        "04": "April",
+        "5": "May",
+        "05": "May",
+        "6": "June",
+        "06": "June",
+        "7": "July",
+        "07": "July",
+        "8": "August",
+        "08": "August",
+        "9": "September",
+        "09": "September",
+        "10": "October",
+        "11": "November",
+        "12": "December",
+    }
+    if lower in month_by_number:
+        return month_by_number[lower]
+
+    month_by_name: dict[str, str] = {
+        "jan": "January",
+        "january": "January",
+        "feb": "February",
+        "february": "February",
+        "mar": "March",
+        "march": "March",
+        "apr": "April",
+        "april": "April",
+        "may": "May",
+        "jun": "June",
+        "june": "June",
+        "jul": "July",
+        "july": "July",
+        "aug": "August",
+        "august": "August",
+        "sep": "September",
+        "sept": "September",
+        "september": "September",
+        "oct": "October",
+        "october": "October",
+        "nov": "November",
+        "november": "November",
+        "dec": "December",
+        "december": "December",
+    }
+    if lower in month_by_name:
+        return month_by_name[lower]
+
+    # Last resort: Title-case input (useful if user already typed full month).
+    candidate = cleaned[:1].upper() + cleaned[1:].lower()
+    return candidate
+
+
+def get_sheet_for_month(month: str) -> gspread.Worksheet:
+    """Get the worksheet for a specified month name."""
+    month_name = normalize_month_name(month)
+    return workbook.worksheet(month_name)
+
+
 def get_current_sheet() -> gspread.Worksheet:
     """Get the current sheet for the current month."""
-    current_month = datetime.now().strftime("%B")
-    return workbook.worksheet(current_month)
+    return get_sheet_for_month(datetime.now().strftime("%B"))
 
 
 def load_spending_data() -> dict:
@@ -394,6 +470,63 @@ def load_existing_csv_rows(sheet: gspread.Worksheet) -> list[dict[str, str]]:
     return existing
 
 
+def load_receiver_category_map_from_sheet(sheet: gspread.Worksheet) -> dict[str, str]:
+    existing = load_existing_csv_rows(sheet)
+    receiver_to_category: dict[str, str] = {}
+
+    for r in existing:
+        receiver = (r.get("receiver") or "").strip()
+        category = (r.get("item") or "").strip()
+        if not receiver or not category:
+            continue
+        receiver_to_category[normalize_receiver(receiver)] = category
+
+    return receiver_to_category
+
+
+def categorize_spendings_using_sheet_cache(
+    sheet: gspread.Worksheet, spendings: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    if not spendings:
+        return []
+
+    receiver_to_category = load_category_cache()
+    receiver_to_category |= load_receiver_category_map_from_sheet(sheet)
+
+    # Import lazily so the bot can run without Anthropic configured.
+    from claude_categorizer import NEEDS_WANTS_MAP, categorize_spendings_with_claude, enrich_spendings_from_category_map
+
+    _, unknown = enrich_spendings_from_category_map(spendings, receiver_to_category)
+
+    if unknown:
+        try:
+            newly = categorize_spendings_with_claude(unknown)
+            for s in newly:
+                receiver_key = normalize_receiver((s.get("receiver") or "").strip())
+                category = (s.get("category") or "").strip()
+                if receiver_key and category:
+                    receiver_to_category[receiver_key] = category
+            save_category_cache(receiver_to_category)
+        except Exception:
+            # If Claude is unavailable, we still upload what we can (and keep unknown categories empty).
+            newly = []
+
+    # Re-apply the final mapping (sheet+cache+newly), preserving original order.
+    final: list[dict[str, str]] = []
+    for s in spendings:
+        receiver_key = normalize_receiver((s.get("receiver") or "").strip())
+        category = (receiver_to_category.get(receiver_key) or "").strip()
+        if not category:
+            final.append(s)
+            continue
+        needs_wants = NEEDS_WANTS_MAP.get(category) or "Other"
+        final.append({**s, "category": category, "needsWants": needs_wants})
+
+    save_category_cache(receiver_to_category)
+    return final
+
+
+
 def write_csv_rows_sorted(sheet: gspread.Worksheet, rows: list[dict[str, str]]) -> None:
     values: list[list[object]] = []
     for r in rows:
@@ -439,15 +572,14 @@ def write_csv_rows_sorted(sheet: gspread.Worksheet, rows: list[dict[str, str]]) 
     )
 
 
-def add_and_sort_csv_spendings_to_sheet(new_spendings: list[dict[str, str]]) -> int:
-    sheet = get_current_sheet()
+def add_and_sort_csv_spendings_to_sheet_on(sheet: gspread.Worksheet, new_spendings: list[dict[str, str]]) -> int:
     existing = load_existing_csv_rows(sheet)
 
     incoming_rows: list[dict[str, str]] = []
     for item in new_spendings:
         incoming_rows.append(
             {
-                "item": "",  # keep empty for manual input
+                "item": (item.get("category") or "").strip(),  # category if provided; otherwise keep empty
                 "receiver": item["receiver"],
                 "amount": item["amount"],
                 "date": item["date"],
@@ -462,8 +594,11 @@ def add_and_sort_csv_spendings_to_sheet(new_spendings: list[dict[str, str]]) -> 
     return len(incoming_rows)
 
 
-def ensure_sheet_headers() -> None:
-    sheet = get_current_sheet()
+def add_and_sort_csv_spendings_to_sheet(new_spendings: list[dict[str, str]]) -> int:
+    return add_and_sort_csv_spendings_to_sheet_on(get_current_sheet(), new_spendings)
+
+
+def ensure_sheet_headers_on(sheet: gspread.Worksheet) -> None:
     sheet_id = sheet.id
 
     light_green = {"red": 0.85, "green": 0.95, "blue": 0.85}
@@ -567,6 +702,10 @@ def ensure_sheet_headers() -> None:
     )
 
 
+def ensure_sheet_headers() -> None:
+    ensure_sheet_headers_on(get_current_sheet())
+
+
 def chunk_lines(lines: list[str], header: str, max_chars: int = 3500) -> list[str]:
     # Telegram max is 4096; keep buffer for safety.
     chunks: list[str] = []
@@ -620,6 +759,7 @@ async def process_update(bot: Bot, update: Update) -> bool:
             csv_bytes = await tg_file.download_as_bytearray()
             csv_text = decode_csv_bytes(bytes(csv_bytes))
             spendings = parse_csv_spendings(csv_text)
+            spendings = categorize_spendings_using_sheet_cache(get_current_sheet(), spendings)
             uploaded_count = add_and_sort_csv_spendings_to_sheet(spendings)
             if uploaded_count == 0:
                 await bot.send_message(chat_id=chat_id, text="CSV received, but no spendings found.")
@@ -665,6 +805,139 @@ async def process_update(bot: Bot, update: Update) -> bool:
         return False
 
 
+def _start_of_current_month_utc() -> datetime:
+    now = datetime.now(timezone.utc)
+    return datetime(year=now.year, month=now.month, day=1, tzinfo=timezone.utc)
+
+
+async def handle_csv_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if update.effective_user and not is_authorized(update.effective_user.id):
+        return
+    if not update.message.document or not update.message.document.file_name:
+        return
+
+    file_name = update.message.document.file_name.strip()
+    if not file_name.lower().endswith(".csv"):
+        return
+
+    ensure_sheet_headers()
+
+    tg_file = await context.bot.get_file(update.message.document.file_id)
+    csv_bytes = await tg_file.download_as_bytearray()
+    csv_text = decode_csv_bytes(bytes(csv_bytes))
+
+    spendings = parse_csv_spendings(csv_text)
+    spendings = categorize_spendings_using_sheet_cache(get_current_sheet(), spendings)
+    uploaded_count = add_and_sort_csv_spendings_to_sheet(spendings)
+
+    if uploaded_count == 0:
+        await update.message.reply_text("CSV received, but no spendings found.")
+        return
+
+    await update.message.reply_text(f"Successfully uploaded the csv to Google Sheets. ({uploaded_count} rows)")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if update.effective_user and not is_authorized(update.effective_user.id):
+        return
+    if not update.message.text:
+        return
+
+    # Ignore very old messages (e.g. after webhook downtime / retries) outside current month.
+    # This keeps sheet inserts stable if Telegram retries stale deliveries.
+    if update.message.date and update.message.date < _start_of_current_month_utc():
+        return
+
+    text: str = update.message.text
+    user_id = str(update.message.chat.id)
+
+    print(f'User ({user_id}): "{text}"')
+
+    command = text.strip().split()[0] if text.strip().startswith("/") else ""
+    if command in {"/start", "/help", "/month_total", "/edit"}:
+        if command == "/start":
+            response = get_start_text()
+        elif command == "/help":
+            response = get_help_text()
+        elif command == "/month_total":
+            response = build_month_total_text()
+        else:
+            response = "🔍 This feature is not available yet."
+
+        print(f"Bot: {response}")
+        await update.message.reply_text(response)
+        return
+
+    expense = parse_expense(text)
+    if not expense:
+        await update.message.reply_text(
+            '❓ I didn\'t understand that.\n\n'
+            'To log an expense, send: <amount> <description>\n'
+            'Example: 15 alepa\n\n'
+            'Type /help for more info.'
+        )
+        return
+
+    amount, label = expense
+    success = add_expense(user_id, amount, label)
+    if not success:
+        await update.message.reply_text("❌ Failed to save expense. Please try again.")
+        return
+
+    await update.message.reply_text(f"✅ Saved: €{amount:.2f} - {label}")
+
+
+async def run_webhook_server() -> None:
+    """
+    Recommended for Render: long-lived service + Telegram webhook delivery (no polling gaps).
+
+    Required env:
+      - TELEGRAM_BOT_TOKEN
+      - PUBLIC_URL (e.g. https://your-service.onrender.com)
+      - PORT (Render provides)
+    Optional:
+      - WEBHOOK_PATH (default: /telegram-webhook)
+    """
+    if not TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+
+    public_url = (os.environ.get("PUBLIC_URL") or "").strip().rstrip("/")
+    if not public_url:
+        raise ValueError("PUBLIC_URL is not set (e.g. https://your-service.onrender.com)")
+
+    port = int(os.environ.get("PORT") or "10000")
+    webhook_path = (os.environ.get("WEBHOOK_PATH") or "/telegram-webhook").strip()
+    if not webhook_path.startswith("/"):
+        webhook_path = f"/{webhook_path}"
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("month_total", month_total_command))
+    app.add_handler(CommandHandler("edit", edit_command))
+
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_csv_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_error_handler(error)
+
+    await app.bot.set_webhook(url=f"{public_url}{webhook_path}")
+
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path.lstrip("/"),
+        webhook_url=f"{public_url}{webhook_path}",
+        drop_pending_updates=False,
+        close_loop=False,
+    )
+
+
 async def run_cron_drain() -> None:
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
@@ -695,5 +968,10 @@ async def run_cron_drain() -> None:
 
 
 if __name__ == '__main__':
-    print("Running cron drain...")
-    asyncio.run(run_cron_drain())
+    run_mode = (os.environ.get("RUN_MODE") or "cron").strip().lower()
+    if run_mode == "webhook":
+        print("Running webhook server...")
+        asyncio.run(run_webhook_server())
+    else:
+        print("Running cron drain...")
+        asyncio.run(run_cron_drain())
