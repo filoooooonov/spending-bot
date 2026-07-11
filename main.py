@@ -354,38 +354,6 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
      
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    
-    text: str = update.message.text
-    user_id = str(update.message.chat.id)
-    
-    print(f'User ({user_id}): "{text}"')
-    
-    # Try to parse as expense
-    expense = parse_expense(text)
-    if expense:
-        amount, label = expense
-        success = add_expense(user_id, amount, label)
-        if not success:
-            response = '❌ Failed to save expense. Please try again.'
-        else:
-            tracker = await forward_to_tracker(amount, label, update.message.message_id)
-            response = f'✅ Saved: €{amount:.2f} - {label}\n{tracker}'
-    else:
-        response = (
-            '❓ I didn\'t understand that.\n\n'
-            'To log an expense, send: <amount> <description>\n'
-            'Example: 15 alepa\n\n'
-            'Type /help for more info.'
-        )
-    
-    print(f'Bot: {response}')
-    await update.message.reply_text(response)
-
-
-
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
