@@ -234,12 +234,18 @@ def add_expense(user_id: str, amount: float, label: str) -> bool:
         return False
 
 
-async def forward_to_tracker(amount: float, label: str, message_id: int | None) -> None:
+async def forward_to_tracker(amount: float, label: str, message_id: int | None) -> str:
     """Mirror a logged expense into the finance tracker (best-effort — a tracker
-    outage must never break the Sheets logging, which is the source of truth)."""
+    outage must never break the Sheets logging, which is the source of truth).
+    Returns a short status string that gets appended to the Telegram reply, so
+    the outcome is visible without digging through host logs."""
     if not TRACKER_CASH_URL or not TRACKER_CASH_SECRET:
-        print("Tracker forward skipped: TRACKER_CASH_URL/TRACKER_CASH_SECRET not set")
-        return
+        missing = []
+        if not TRACKER_CASH_URL:
+            missing.append("TRACKER_CASH_URL")
+        if not TRACKER_CASH_SECRET:
+            missing.append("TRACKER_CASH_SECRET")
+        return f"⚠️ tracker: env not set ({', '.join(missing)})"
     payload: dict = {
         "amount": amount,
         "description": label,
@@ -255,11 +261,10 @@ async def forward_to_tracker(amount: float, label: str, message_id: int | None) 
                 headers={"X-Tracker-Secret": TRACKER_CASH_SECRET},
             )
             if resp.status_code >= 300:
-                print(f"Tracker forward failed: {resp.status_code} {resp.text}")
-            else:
-                print(f"Tracker forward ok ({resp.status_code}): €{amount:.2f} {label}")
+                return f"⚠️ tracker: {resp.status_code} {resp.text[:100]}"
+            return "→ tracker ✓"
     except Exception as e:
-        print(f"Tracker forward error: {e}")
+        return f"⚠️ tracker error: {type(e).__name__}: {e}"
 
 
 def parse_expense(text: str) -> tuple[float, str] | None:
@@ -366,8 +371,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not success:
             response = '❌ Failed to save expense. Please try again.'
         else:
-            await forward_to_tracker(amount, label, update.message.message_id)
-            response = f'✅ Saved: €{amount:.2f} - {label}'
+            tracker = await forward_to_tracker(amount, label, update.message.message_id)
+            response = f'✅ Saved: €{amount:.2f} - {label}\n{tracker}'
     else:
         response = (
             '❓ I didn\'t understand that.\n\n'
