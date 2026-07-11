@@ -931,7 +931,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ Failed to save expense. Please try again.")
         return
 
-    await update.message.reply_text(f"✅ Saved: €{amount:.2f} - {label}")
+    tracker = await forward_to_tracker(amount, label, update.message.message_id)
+    await update.message.reply_text(f"✅ Saved: €{amount:.2f} - {label}\n{tracker}")
 
 
 def run_webhook_server() -> None:
