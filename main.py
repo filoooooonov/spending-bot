@@ -2,7 +2,12 @@ from typing import Final
 import asyncio
 import csv
 import io
+import sys
 import httpx
+
+# Render captures stdout through a pipe, which block-buffers by default — flush
+# each line so debug prints show up immediately.
+sys.stdout.reconfigure(line_buffering=True)
 from telegram import Update
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
