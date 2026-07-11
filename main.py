@@ -233,6 +233,7 @@ async def forward_to_tracker(amount: float, label: str, message_id: int | None) 
     """Mirror a logged expense into the finance tracker (best-effort — a tracker
     outage must never break the Sheets logging, which is the source of truth)."""
     if not TRACKER_CASH_URL or not TRACKER_CASH_SECRET:
+        print("Tracker forward skipped: TRACKER_CASH_URL/TRACKER_CASH_SECRET not set")
         return
     payload: dict = {
         "amount": amount,
@@ -250,6 +251,8 @@ async def forward_to_tracker(amount: float, label: str, message_id: int | None) 
             )
             if resp.status_code >= 300:
                 print(f"Tracker forward failed: {resp.status_code} {resp.text}")
+            else:
+                print(f"Tracker forward ok ({resp.status_code}): €{amount:.2f} {label}")
     except Exception as e:
         print(f"Tracker forward error: {e}")
 
