@@ -2,6 +2,7 @@ from typing import Final
 import asyncio
 import csv
 import io
+import httpx
 from telegram import Update
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -49,6 +50,9 @@ workbook = client.open_by_key(sheet_id)
 TOKEN: Final = os.environ.get('TELEGRAM_BOT_TOKEN')
 BOT_USERNAME: Final = os.environ.get('TELEGRAM_BOT_USERNAME', '@AlekseiFilonovSpendingBot')
 ALLOWED_USER_ID: Final = os.environ.get('ALLOWED_USER_ID')
+# Finance tracker (Convex) — mirror each cash expense into its ledger.
+TRACKER_CASH_URL: Final = os.environ.get('TRACKER_CASH_URL')
+TRACKER_CASH_SECRET: Final = os.environ.get('TRACKER_CASH_SECRET')
 SPENDING_DATA_FILE: Final = 'spending_data.json'
 TELEGRAM_CURSOR_FILE: Final = os.environ.get("TELEGRAM_CURSOR_FILE", "telegram_cursor.json")
 
@@ -225,6 +229,31 @@ def add_expense(user_id: str, amount: float, label: str) -> bool:
         return False
 
 
+async def forward_to_tracker(amount: float, label: str, message_id: int | None) -> None:
+    """Mirror a logged expense into the finance tracker (best-effort — a tracker
+    outage must never break the Sheets logging, which is the source of truth)."""
+    if not TRACKER_CASH_URL or not TRACKER_CASH_SECRET:
+        return
+    payload: dict = {
+        "amount": amount,
+        "description": label,
+        "date": datetime.now().strftime("%Y-%m-%d"),
+    }
+    if message_id is not None:
+        payload["externalId"] = f"telegram:{message_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as http_client:
+            resp = await http_client.post(
+                TRACKER_CASH_URL,
+                json=payload,
+                headers={"X-Tracker-Secret": TRACKER_CASH_SECRET},
+            )
+            if resp.status_code >= 300:
+                print(f"Tracker forward failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Tracker forward error: {e}")
+
+
 def parse_expense(text: str) -> tuple[float, str] | None:
     """Parse expense from text like '15 alepa' or '15.50 grocery store'."""
     match = re.match(r'^(\d+(?:[.,]\d+)?)\s+(.+)$', text.strip())
@@ -329,6 +358,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not success:
             response = '❌ Failed to save expense. Please try again.'
         else:
+            await forward_to_tracker(amount, label, update.message.message_id)
             response = f'✅ Saved: €{amount:.2f} - {label}'
     else:
         response = (

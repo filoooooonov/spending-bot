@@ -2,3 +2,4 @@ python-telegram-bot[webhooks]==22.5
 python-dotenv==1.0.1
 gspread==6.1.4
 google-auth==2.34.0
+httpx
