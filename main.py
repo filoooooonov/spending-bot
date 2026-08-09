@@ -175,8 +175,14 @@ def is_authorized(user_id: int) -> bool:
     return str(user_id) == ALLOWED_USER_ID
 
 
-def add_expense(user_id: str, amount: float, label: str) -> bool:
-    """Add an expense to the first empty cell starting from row 5 in columns M and N."""
+def add_expense(user_id: str, amount: float, label: str) -> tuple[bool, str]:
+    """Mirror an expense into the month's sheet (columns M/N/O, first empty row from 5).
+
+    Best-effort: the finance tracker is the source of truth, so a missing month tab
+    or a Sheets outage must not fail the log. Returns (ok, detail). A non-empty detail
+    is a genuine failure worth showing in the Telegram reply; an empty detail marks an
+    expected skip that is only logged.
+    """
     try:
         sheet = get_current_sheet()
         col_m = sheet.col_values(13)
@@ -227,25 +233,35 @@ def add_expense(user_id: str, amount: float, label: str) -> bool:
         # Verify write succeeded - just check that something was written to the cells
         written_label = sheet.cell(next_row, 13).value
         written_amount = sheet.cell(next_row, 14).value
-        
-        return (written_label is not None and str(written_label).strip() != "" and
-                written_amount is not None and str(written_amount).strip() != "")
-    except Exception:
-        return False
+
+        if (written_label is not None and str(written_label).strip() != "" and
+                written_amount is not None and str(written_amount).strip() != ""):
+            return True, ""
+        print(f"[sheets] write to row {next_row} did not stick")
+        return False, "sheets: write not confirmed"
+    except gspread.WorksheetNotFound as e:
+        # Expected while Sheets is unused — no tab is created for the current month.
+        # Empty detail keeps this out of the Telegram reply; the log still records it.
+        print(f"[sheets] no worksheet for month: {e} (mirror skipped)")
+        return False, ""
+    except Exception as e:
+        print(f"[sheets] add_expense failed: {type(e).__name__}: {e}")
+        return False, f"sheets: {type(e).__name__}"
 
 
-async def forward_to_tracker(amount: float, label: str, message_id: int | None) -> str:
-    """Mirror a logged expense into the finance tracker (best-effort — a tracker
-    outage must never break the Sheets logging, which is the source of truth).
-    Returns a short status string that gets appended to the Telegram reply, so
-    the outcome is visible without digging through host logs."""
+async def forward_to_tracker(amount: float, label: str, message_id: int | None) -> tuple[bool, str]:
+    """Write a logged expense to the finance tracker — the source of truth.
+
+    Returns (ok, detail). A failure here fails the whole log, so detail carries the
+    real error into the Telegram reply instead of a generic message."""
     if not TRACKER_CASH_URL or not TRACKER_CASH_SECRET:
         missing = []
         if not TRACKER_CASH_URL:
             missing.append("TRACKER_CASH_URL")
         if not TRACKER_CASH_SECRET:
             missing.append("TRACKER_CASH_SECRET")
-        return f"⚠️ tracker: env not set ({', '.join(missing)})"
+        print(f"[tracker] env not set: {', '.join(missing)}")
+        return False, f"tracker env not set ({', '.join(missing)})"
     payload: dict = {
         "amount": amount,
         "description": label,
@@ -261,10 +277,13 @@ async def forward_to_tracker(amount: float, label: str, message_id: int | None) 
                 headers={"X-Tracker-Secret": TRACKER_CASH_SECRET},
             )
             if resp.status_code >= 300:
-                return f"⚠️ tracker: {resp.status_code} {resp.text[:100]}"
-            return "→ tracker ✓"
+                print(f"[tracker] HTTP {resp.status_code}: {resp.text[:200]}")
+                return False, f"tracker {resp.status_code}: {resp.text[:100]}"
+            print("[tracker] ok")
+            return True, ""
     except Exception as e:
-        return f"⚠️ tracker error: {type(e).__name__}: {e}"
+        print(f"[tracker] {type(e).__name__}: {e}")
+        return False, f"tracker error: {type(e).__name__}: {e}"
 
 
 def parse_expense(text: str) -> tuple[float, str] | None:
@@ -806,10 +825,14 @@ async def process_update(bot: Bot, update: Update) -> bool:
     expense = parse_expense(text)
     if expense:
         amount, label = expense
-        success = add_expense(str(chat_id), amount, label)
-        if not success:
-            print("Failed to save expense.")
+        message_id = update.message.message_id if update.message else None
+        tracked, tracker_detail = await forward_to_tracker(amount, label, message_id)
+        if not tracked:
+            print(f"Failed to save expense: {tracker_detail}")
             return False
+        mirrored, sheets_detail = add_expense(str(chat_id), amount, label)
+        if not mirrored and sheets_detail:
+            print(f"Sheets mirror failed: {sheets_detail}")
         return True
     else:
         print("Unrecognized message format.")
@@ -894,13 +917,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     amount, label = expense
-    success = add_expense(user_id, amount, label)
-    if not success:
-        await update.message.reply_text("❌ Failed to save expense. Please try again.")
+
+    # The tracker is the source of truth — it gates the log.
+    tracked, tracker_detail = await forward_to_tracker(amount, label, update.message.message_id)
+    if not tracked:
+        await update.message.reply_text(f"❌ Failed to save expense.\n⚠️ {tracker_detail}")
         return
 
-    tracker = await forward_to_tracker(amount, label, update.message.message_id)
-    await update.message.reply_text(f"✅ Saved: €{amount:.2f} - {label}\n{tracker}")
+    # Sheets is a best-effort mirror; a missing month tab must not fail the log.
+    mirrored, sheets_detail = add_expense(user_id, amount, label)
+
+    reply = f"✅ Saved: €{amount:.2f} - {label}"
+    if not mirrored and sheets_detail:
+        # Empty detail means an expected skip (e.g. no tab for this month) — log only.
+        reply += f"\n⚠️ {sheets_detail}"
+    await update.message.reply_text(reply)
 
 
 def run_webhook_server() -> None:
